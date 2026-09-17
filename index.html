@@ -1072,46 +1072,58 @@ let audioStarted = false;
 let musicMuted = false;
 let padSynth, pluckSynth, bassSynth, drum, mainLoop, stringsSynth, brassSynth;
 
+const IS_MOBILE = /Android|iPhone|iPad|iPod|Mobi/i.test(navigator.userAgent);
+
 function buildMusic(){
   // Larger buffer / more headroom before glitching, at the cost of a little latency —
-  // fine for background music that isn't reacting to input.
-  try { Tone.getContext().latencyHint = "playback"; } catch(e){}
+  // fine for background music that isn't reacting to input. Mobile CPUs need an even
+  // bigger scheduling cushion (lookAhead) or the audio thread starts missing its
+  // deadlines under load, which is what crackling actually is.
+  try {
+    Tone.getContext().latencyHint = "playback";
+    Tone.getContext().lookAhead = IS_MOBILE ? 0.3 : 0.1;
+  } catch(e){}
 
-  // Freeverb is a light algorithmic reverb (cheap sallen-key comb/allpass filters),
-  // far less CPU than a long convolution reverb — same hall feel, no crackling.
-  const reverb = new Tone.Freeverb({ roomSize: 0.78, dampening: 3000, wet: 0.3 }).toDestination();
+  // On mobile: no reverb bus at all (a comb/allpass network run continuously is real,
+  // constant CPU cost) and everything connects straight to the destination instead.
+  const bus = IS_MOBILE
+    ? Tone.getDestination()
+    : new Tone.Freeverb({ roomSize: 0.78, dampening: 3000, wet: 0.3 }).toDestination();
 
-  // Strings carry the harmony alone now (dropped the redundant doubled pad layer —
-  // same two layers playing identical chords was pure extra voice load for no audible gain).
-  const stringFilter = new Tone.Filter({ frequency: 2000, type: "lowpass", rolloff: -12 }).connect(reverb);
-  stringsSynth = new Tone.PolySynth({ maxPolyphony: 6, voice: Tone.Synth, options: {
-    oscillator: { type: "fatsawtooth", count: 2, spread: 18 },
-    envelope: { attack: 1.1, decay: 0.5, sustain: 0.8, release: 2.2 }
-  }}).connect(stringFilter);
+  // Strings: mobile drops the lowpass filter node (one less thing to process per
+  // sample) and halves both the unison count and polyphony ceiling.
+  const stringsTarget = IS_MOBILE ? bus : new Tone.Filter({ frequency: 2000, type: "lowpass", rolloff: -12 }).connect(bus);
+  stringsSynth = new Tone.PolySynth({ maxPolyphony: IS_MOBILE ? 3 : 6, voice: Tone.Synth, options: {
+    oscillator: IS_MOBILE ? { type: "sawtooth" } : { type: "fatsawtooth", count: 2, spread: 18 },
+    envelope: { attack: 1.1, decay: 0.5, sustain: 0.8, release: IS_MOBILE ? 1.4 : 2.2 }
+  }}).connect(stringsTarget);
   stringsSynth.volume.value = -13;
 
-  // Brass swells, capped low-polyphony since only 2 notes ever sound at once
-  brassSynth = new Tone.PolySynth({ maxPolyphony: 3, voice: Tone.Synth, options: {
-    oscillator: { type: "sawtooth" },
-    envelope: { attack: 0.3, decay: 0.35, sustain: 0.5, release: 1.0 }
-  }}).connect(reverb);
-  brassSynth.volume.value = -19;
+  // Brass swells are skipped entirely on mobile — they only ever added an accent,
+  // and cutting a whole synth instance out is worth far more than the accent itself.
+  if(!IS_MOBILE){
+    brassSynth = new Tone.PolySynth({ maxPolyphony: 3, voice: Tone.Synth, options: {
+      oscillator: { type: "sawtooth" },
+      envelope: { attack: 0.3, decay: 0.35, sustain: 0.5, release: 1.0 }
+    }}).connect(bus);
+    brassSynth.volume.value = -19;
+  }
 
   // Plucked line — thinned out below (4 notes/bar instead of 8) so it no longer
   // stacks release tails on top of everything else firing on the same beat
-  pluckSynth = new Tone.PolySynth({ maxPolyphony: 4, voice: Tone.Synth, options: {
+  pluckSynth = new Tone.PolySynth({ maxPolyphony: IS_MOBILE ? 2 : 4, voice: Tone.Synth, options: {
     oscillator: { type: "triangle" },
     envelope: { attack: 0.006, decay: 0.22, sustain: 0.02, release: 0.35 }
-  }}).connect(reverb);
+  }}).connect(bus);
   pluckSynth.volume.value = -20;
 
   bassSynth = new Tone.Synth({
     oscillator: { type: "sine" },
-    envelope: { attack: 1.0, decay: 0.5, sustain: 0.85, release: 2.0 }
-  }).connect(reverb);
+    envelope: { attack: 1.0, decay: 0.5, sustain: 0.85, release: IS_MOBILE ? 1.3 : 2.0 }
+  }).connect(bus);
   bassSynth.volume.value = -13;
 
-  drum = new Tone.MembraneSynth({ octaves: 3, pitchDecay: 0.045 }).connect(reverb);
+  drum = new Tone.MembraneSynth({ octaves: 3, pitchDecay: 0.045 }).connect(bus);
   drum.volume.value = -12;
 
   Tone.Transport.bpm.value = 72;
@@ -1129,21 +1141,24 @@ function buildMusic(){
     stringsSynth.triggerAttackRelease(c.strings, "1m", time);
     bassSynth.triggerAttackRelease(c.bass, "1m", time);
     drum.triggerAttackRelease("C1", "8n", time);
-    if(bar % 2 === 0){
+    if(!IS_MOBILE && bar % 2 === 0){
       brassSynth.triggerAttackRelease(c.brass, "2n", time);
     }
-    // one short timpani roll into every 4-bar turnover, spaced so it never
-    // overlaps the main downbeat hit above
-    if(bar % 4 === 3){
+    // one short timpani roll into every 4-bar turnover — skipped on mobile,
+    // a rapid 3-hit burst is exactly the kind of spike that causes crackling
+    if(!IS_MOBILE && bar % 4 === 3){
       const rollStart = time + Tone.Time("2n").toSeconds();
       for(let k=0;k<3;k++){
         drum.triggerAttackRelease("C1", "16n", rollStart + Tone.Time("8n").toSeconds()*k);
       }
     }
     // quarter-note arpeggio instead of eighths — a quarter of the previous
-    // trigger density, which was the single biggest source of the crackling
-    c.arp.forEach((note, i)=>{
-      pluckSynth.triggerAttackRelease(note, "8n", time + Tone.Time("4n").toSeconds()*i);
+    // trigger density, which was the single biggest source of the crackling.
+    // Mobile halves it again, playing only the 1st and 3rd beat.
+    const arpNotes = IS_MOBILE ? [c.arp[0], c.arp[2]] : c.arp;
+    const arpStep = IS_MOBILE ? "2n" : "4n";
+    arpNotes.forEach((note, i)=>{
+      pluckSynth.triggerAttackRelease(note, "8n", time + Tone.Time(arpStep).toSeconds()*i);
     });
     bar++;
   }, "1m");
