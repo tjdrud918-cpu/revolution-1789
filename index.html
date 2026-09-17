@@ -1075,14 +1075,7 @@ let padSynth, pluckSynth, bassSynth, drum, mainLoop, stringsSynth, brassSynth;
 const IS_MOBILE = /Android|iPhone|iPad|iPod|Mobi/i.test(navigator.userAgent);
 
 function buildMusic(){
-  // Larger buffer / more headroom before glitching, at the cost of a little latency —
-  // fine for background music that isn't reacting to input. Mobile CPUs need an even
-  // bigger scheduling cushion (lookAhead) or the audio thread starts missing its
-  // deadlines under load, which is what crackling actually is.
-  try {
-    Tone.getContext().latencyHint = "playback";
-    Tone.getContext().lookAhead = IS_MOBILE ? 0.3 : 0.1;
-  } catch(e){}
+  try { Tone.getContext().latencyHint = "playback"; } catch(e){}
 
   // On mobile: no reverb bus at all (a comb/allpass network run continuously is real,
   // constant CPU cost) and everything connects straight to the destination instead.
@@ -1174,10 +1167,44 @@ function initAudio(){
   }).catch(()=>{});
 }
 
+/* Mobile browsers (especially iOS Safari) suspend the AudioContext the moment
+   the tab is backgrounded, the screen locks, or a call/notification interrupts —
+   and unlike desktop, they do NOT resume it automatically when the page comes
+   back. Without this, the music just stops partway through and never returns.
+   Re-check on every point the page could regain focus, and resume both the
+   context and the transport loop if either has stopped. */
+function resumeAudioIfNeeded(){
+  if(!audioStarted || musicMuted) return;
+  try{
+    if(Tone.getContext().state !== "running"){
+      Tone.getContext().resume().then(()=>{
+        if(Tone.Transport.state !== "started") Tone.Transport.start();
+        if(mainLoop && mainLoop.state !== "started") mainLoop.start(0);
+      }).catch(()=>{});
+    } else {
+      if(Tone.Transport.state !== "started") Tone.Transport.start();
+      if(mainLoop && mainLoop.state !== "started") mainLoop.start(0);
+    }
+  } catch(e){}
+}
+document.addEventListener("visibilitychange", ()=>{
+  if(document.visibilityState === "visible") resumeAudioIfNeeded();
+});
+window.addEventListener("pageshow", resumeAudioIfNeeded);
+window.addEventListener("focus", resumeAudioIfNeeded);
+// A tap anywhere is also a safe moment to double-check — cheap no-op if
+// everything is already running fine.
+document.addEventListener("touchend", resumeAudioIfNeeded, { passive: true });
+// Watchdog: some mobile browsers silently drop the transport/loop after the
+// very first bar with no error and no visibility change to hook into — poll
+// every few seconds and force it back to life if that happens.
+setInterval(resumeAudioIfNeeded, 4000);
+
 $("btnMute").addEventListener("click", ()=>{
   musicMuted = !musicMuted;
   Tone.Destination.mute = musicMuted;
   $("btnMute").textContent = musicMuted ? "🔇" : "🔊";
+  if(!musicMuted) resumeAudioIfNeeded();
 });
 
 /* ================= SOUND EFFECTS ================= */
